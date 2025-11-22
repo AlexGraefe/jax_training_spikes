@@ -1,3 +1,4 @@
+import copy
 import functools
 import time
 
@@ -185,100 +186,83 @@ class VisionTransformer(eqx.Module):
         x = self.mlp(x)
 
         return x
-    
-@eqx.filter_value_and_grad
-def compute_grads(
-    model: VisionTransformer, images: jnp.ndarray, labels: jnp.ndarray, key
-):
-    logits = jax.vmap(model, in_axes=(0, None, 0))(images, True, key)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
 
-    return jnp.mean(loss)
-
-@eqx.filter_jit
-def step_model(
-    model: VisionTransformer,
-    optimizer: optax.GradientTransformation,
-    state: optax.OptState,
-    images: jnp.ndarray,
-    labels: jnp.ndarray,
-    key,
-):
-    loss, grads = compute_grads(model, images, labels, key)
-    # updates, new_state = optimizer.update(grads, state, model)
-    new_state = state
-
-    # model = eqx.apply_updates(model, grads)
-
-    return None, None, loss * grads.positional_embedding[0]  # just to use grads somehow
-
-def fake(model):
+def flatten_twice(model):
     unflattened = jax.tree.flatten(model)
     unflattened = jax.tree.flatten(model)
 
-
-def on_gc(phase, info):
-    if phase == "stop":
-        print(f"GC stopped: {info['collected']}")
-
+def flatten_once(model):
+    unflattened = jax.tree.flatten(model)
 
 def train(
     model: VisionTransformer,
-    optimizer: optax.GradientTransformation,
-    state: optax.OptState,
     num_steps: int,
     print_every: int = 200,
     key=None,
 ):
-    eqx.debug.assert_max_traces
-    images = jnp.zeros((batch_size, channels, height, width))
-    labels = jnp.zeros((batch_size,), dtype=jnp.int32)
-
-    training_times_gc_enabled = []
-    losses = []
-    len_gc = []
-
-    key, *subkeys = jr.split(key, num=batch_size + 1)
-    subkeys = jnp.array(subkeys)
-    for step in tqdm.tqdm(range(num_steps)):
+    # Benchmark flatten_once with GC enabled
+    gc.enable()
+    flatten_once_gc_enabled = []
+    for step in tqdm.tqdm(range(num_steps), desc="flatten_once (GC enabled)"):
         start_time = time.time()
-        loss = 0
-        _ = fake(model)
-        losses.append(loss)
+        flatten_once(model)
+        if step > 0:  # exclude first run for JIT compilation
+            flatten_once_gc_enabled.append(time.time() - start_time)
     
+    # Benchmark flatten_twice with GC enabled
+    flatten_twice_gc_enabled = []
+    for step in tqdm.tqdm(range(num_steps), desc="flatten_twice (GC enabled)"):
+        start_time = time.time()
+        flatten_twice(model)
         if step > 0:
-            training_times_gc_enabled.append(time.time() - start_time)
+            flatten_twice_gc_enabled.append(time.time() - start_time)
     
+    # Benchmark flatten_once with GC disabled
     gc.disable()
-    training_times_gc_disabled = []
+    flatten_once_gc_disabled = []
     for step in range(num_steps):
         start_time = time.time()
-        loss = 0
-        _ = fake(model)
-        losses.append(loss)
-        # exclude jit compilation time
+        flatten_once(model)
         if step > 0:
-            training_times_gc_disabled.append(time.time() - start_time)
-
+            flatten_once_gc_disabled.append(time.time() - start_time)
+    
+    # Benchmark flatten_twice with GC disabled
+    flatten_twice_gc_disabled = []
+    for step in range(num_steps):
+        start_time = time.time()
+        flatten_twice(model)
+        if step > 0:
+            flatten_twice_gc_disabled.append(time.time() - start_time)
 
     import matplotlib.pyplot as plt
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
-    # Plot training times
-    ax1.plot(training_times_gc_enabled, marker="o", label="GC Enabled")
-    ax1.plot(training_times_gc_disabled, marker="x", label="GC Disabled")
-    ax1.set_xlabel("Batch Count")
-    ax1.set_ylabel("Training Time (s)")
-    ax1.set_title("Training Times")
+    # Calculate global y-axis limits
+    all_times = (flatten_once_gc_enabled + flatten_once_gc_disabled + 
+                flatten_twice_gc_enabled + flatten_twice_gc_disabled)
+    y_min, y_max = min(all_times), max(all_times)
+    y_range = y_max - y_min
+    y_min -= y_range * 0.05  # Add 5% padding
+    y_max += y_range * 0.05
+    
+    # Plot flatten_once times
+    ax1.plot(flatten_once_gc_enabled, marker="o", label="GC Enabled")
+    ax1.plot(flatten_once_gc_disabled, marker="x", label="GC Disabled")
+    ax1.set_xlabel("Iteration")
+    ax1.set_ylabel("Time (s)")
+    ax1.set_title("flatten_once Benchmark")
+    ax1.set_ylim(y_min, y_max)
     ax1.legend()
     ax1.grid(True)
     
-    # Plot GC object count
-    # ax2.plot(len_gc, marker="s", color="red", label="GC Object Count")
-    ax2.set_xlabel("Batch Count")
-    ax2.set_ylabel("Number of Objects in GC")
-    ax2.set_title("GC Object Count")
+    # Plot flatten_twice times
+    ax2.plot(flatten_twice_gc_enabled, marker="o", label="GC Enabled")
+    ax2.plot(flatten_twice_gc_disabled, marker="x", label="GC Disabled")
+    ax2.set_xlabel("Iteration")
+    ax2.set_ylabel("Time (s)")
+    ax2.set_title("flatten_twice Benchmark")
+    ax2.set_ylim(y_min, y_max)
     ax2.legend()
     ax2.grid(True)
     
@@ -286,101 +270,6 @@ def train(
     plt.show()
 
     return None, None
-
-# def train(
-#     model: VisionTransformer,
-#     optimizer: optax.GradientTransformation,
-#     state: optax.OptState,
-#     num_steps: int,
-#     print_every: int = 200,
-#     key=None,
-# ):
-#     eqx.debug.assert_max_traces
-#     images = jnp.zeros((batch_size, channels, height, width))
-#     labels = jnp.zeros((batch_size,), dtype=jnp.int32)
-
-#     training_times_gc_enabled = []
-#     losses = []
-#     len_gc = []
-
-#     key, *subkeys = jr.split(key, num=batch_size + 1)
-#     subkeys = jnp.array(subkeys)
-
-#     # @eqx.filter_jit
-#     # def my_step_model(b):
-#     #     if b:
-#     #         results = step_model(model, optimizer, state, images, labels, subkeys)
-#     #         return results[0], results[1]
-#     #     else:
-#     #         return None
-
-#     # gc.disable()
-#     for step in tqdm.tqdm(range(num_steps)):
-#         start_time = time.time()
-#         # (mo, _, loss) = step_model(
-#         #     model, optimizer, state, images, labels, subkeys
-#         # )
-#         # del mo
-#         loss = 0
-#         _ = fake(model)
-#         # (_, loss) = my_step_model(True
-#         # )
-
-#         # print(f"Step {step}: {time.time() - start_time}: {len(gc.get_objects())}")
-#         losses.append(loss)
-#         #+ if gc.get_count()[2] == 0:
-#         # obj = gc.get_objects(2)
-#         # for o in obj:
-#         #     print(o)
-#         # print(len(obj))
-#         # exit()
-#         print(f"{time.time() - start_time:.4f}:  {gc.get_count()}, {len(gc.get_objects())}")
-#         # len_gc.append(len(gc.get_objects()))
-#         # print(gc.get_objects(2))
-#         # exclude jit compilation time
-#         if step > 0:
-#             training_times_gc_enabled.append(time.time() - start_time)
-    
-#     # gc.disable()
-#     # training_times_gc_disabled = []
-#     # for step in range(num_steps):
-#     #     key, *subkeys = jr.split(key, num=batch_size + 1)
-#     #     subkeys = jnp.array(subkeys)
-
-#     #     start_time = time.time()
-#     #     (model, state, loss) = step_model(
-#     #         model, optimizer, state, images, labels, subkeys
-#     #     )
-#     #     losses.append(loss)
-#     #     # exclude jit compilation time
-#     #     if step > 0:
-#     #         training_times_gc_disabled.append(time.time() - start_time)
-
-
-#     import matplotlib.pyplot as plt
-
-#     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-    
-#     # Plot training times
-#     ax1.plot(training_times_gc_enabled, marker="o", label="GC Enabled")
-#     ax1.set_xlabel("Batch Count")
-#     ax1.set_ylabel("Training Time (s)")
-#     ax1.set_title("Training Times")
-#     ax1.legend()
-#     ax1.grid(True)
-    
-#     # Plot GC object count
-#     # ax2.plot(len_gc, marker="s", color="red", label="GC Object Count")
-#     ax2.set_xlabel("Batch Count")
-#     ax2.set_ylabel("Number of Objects in GC")
-#     ax2.set_title("GC Object Count")
-#     ax2.legend()
-#     ax2.grid(True)
-    
-#     plt.tight_layout()
-#     plt.show()
-
-#     return model, state
 
 key = jr.PRNGKey(2003)
 
@@ -396,12 +285,4 @@ model = VisionTransformer(
     key=key,
 )
 
-optimizer = optax.adamw(
-    learning_rate=lr,
-    b1=beta1,
-    b2=beta2,
-)
-
-state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
-
-model, state = train(model, optimizer, state, num_steps, key=key)
+model, state = train(model, num_steps, key=key)
